@@ -1039,6 +1039,8 @@ function connectLive(){
     if(exSel.value === 'NSE') exSel.value = 'NFO';
     else if(exSel.value === 'BSE') exSel.value = 'BFO';
   }
+  // Current Nifty futures contracts trade in 0.10 increments.
+  if(/FUT$/.test(symbol)) document.getElementById('wsTick').value = '0.10';
   const exchange = exSel.value;
 
   if(!url){ connLog('URL required','err'); return; }
@@ -1094,22 +1096,23 @@ function connectLive(){
     if(msg.message === 'Authentication successful'){
       connLog('Authenticated ✓','ok');
       setConnStatus('wait','Subscribing…');
-      // Subscribe to Depth (mode 3) for the book and Quote (mode 2) for ltp/volume.
-      // Some adapters (Fyers) omit volume from depth messages, which would
-      // starve trade detection; merging both streams keeps bubbles/CVD alive.
+      // Subscribe to Quote before Depth. OpenAlgo applies a generic mode hierarchy
+      // (Depth > Quote > LTP). With Fyers, Depth does not contain traded volume, so
+      // sending Depth first makes OpenAlgo treat Quote as already covered and the
+      // broker never opens the Quote stream. Quote first keeps both callbacks live.
       liveMerged = {};
+      liveWs.send(JSON.stringify({
+        action: 'subscribe',
+        symbol: symbol,
+        exchange: exchange,
+        mode: 2
+      }));
       liveWs.send(JSON.stringify({
         action: 'subscribe',
         symbol: symbol,
         exchange: exchange,
         mode: 3,
         depth: 5
-      }));
-      liveWs.send(JSON.stringify({
-        action: 'subscribe',
-        symbol: symbol,
-        exchange: exchange,
-        mode: 2
       }));
       return;
     }
@@ -1124,7 +1127,8 @@ function connectLive(){
     // Subscription confirmation
     if(msg.type === 'subscribe'){
       if(msg.status === 'success'){
-        connLog(`Subscribed to ${symbol}@${exchange} ✓`,'ok');
+        const modes = (msg.subscriptions || []).map(s => s.mode).filter(Boolean).join(', ');
+        connLog(`Subscribed ${modes || 'feed'} · ${symbol}@${exchange} ✓`,'ok');
         setConnStatus('on','Streaming');
         document.getElementById('status').textContent = 'Live · ' + symbol;
         document.getElementById('liveDot').className = 'live';
@@ -1161,7 +1165,11 @@ function connectLive(){
   };
 
   liveWs.onclose = (e) => {
-    connLog(`Disconnected (code ${e.code})`,'err');
+    const loopbackBlocked = e.code === 1005 && location.protocol === 'https:' &&
+      /^ws:\/\/(127\.0\.0\.1|localhost)(:|\/)/i.test(url);
+    connLog(loopbackBlocked
+      ? 'Local WebSocket blocked by this browser. Use Chrome or Codex browser.'
+      : `Disconnected (code ${e.code})`, 'err');
     setConnStatus('off','Disconnected');
     document.getElementById('liveDot').className = 'live off';
     document.getElementById('status').textContent = 'Disconnected';
