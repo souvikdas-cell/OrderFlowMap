@@ -1161,7 +1161,9 @@ function processLiveData(data){
   const currentVolume = data.volume || 0;
 
   // Timestamp: use ltt (last traded time) as exchange timestamp, fallback to timestamp
-  const rawTs = data.ltt || data.timestamp || Date.now();
+  // OpenAlgo adapters differ: some send ms, some (e.g. Fyers) send seconds. Normalise.
+  let rawTs = data.ltt || data.timestamp || Date.now();
+  if(rawTs < 1e11) rawTs = rawTs * 1000;
   const exchangeTime = Math.floor(rawTs / 1000);
 
   // Map depth data — filter zero-price levels
