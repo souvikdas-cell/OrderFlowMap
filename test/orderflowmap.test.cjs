@@ -12,6 +12,17 @@ assert.notEqual(connectStart, -1, 'connectLive must exist');
 assert.notEqual(connectEnd, -1, 'disconnectLive must follow connectLive');
 
 const connectSource = html.slice(connectStart, connectEnd);
+const aggregateStart = html.indexOf('function aggregateCandles(');
+const aggregateEnd = html.indexOf('\n/* ==================== COLOR MAPS', aggregateStart);
+
+assert.notEqual(aggregateStart, -1, 'aggregateCandles must exist');
+assert.notEqual(aggregateEnd, -1, 'color maps must follow aggregateCandles');
+
+const aggregateSource = html.slice(aggregateStart, aggregateEnd);
+const aggregateContext = {};
+vm.runInNewContext(`${aggregateSource}\nglobalThis.aggregateCandles = aggregateCandles;`, aggregateContext);
+const aggregateCandles = (bars, seconds) =>
+  JSON.parse(JSON.stringify(aggregateContext.aggregateCandles(bars, seconds)));
 
 function makeHarness({ symbol = 'RELIANCE', exchange = 'NSE', apiKey = 'test-key' } = {}) {
   const elements = {
@@ -95,4 +106,46 @@ test('does not open a socket when the OpenAlgo API key is empty', () => {
 
   assert.equal(harness.sockets.length, 0);
   assert.deepEqual(harness.logs[0], { message: 'API key required', level: 'err' });
+});
+
+test('aggregates per-second OHLC data into one-minute candles', () => {
+  const bars = [
+    { time: 120, mid: 100, open: 100, high: 102, low: 99, close: 101 },
+    { time: 150, mid: 103, open: 101, high: 104, low: 100, close: 103 },
+    { time: 180, mid: 98, open: 103, high: 103, low: 97, close: 98 },
+  ];
+
+  assert.deepEqual(aggregateCandles(bars, 60), [
+    { time: 120, open: 100, high: 104, low: 99, close: 103, lastTime: 150 },
+    { time: 180, open: 103, high: 103, low: 97, close: 98, lastTime: 180 },
+  ]);
+});
+
+test('supports five-minute and ten-minute candle boundaries', () => {
+  const bars = [
+    { time: 0, mid: 100 },
+    { time: 299, mid: 105 },
+    { time: 300, mid: 102 },
+    { time: 599, mid: 108 },
+    { time: 600, mid: 110 },
+  ];
+
+  assert.equal(aggregateCandles(bars, 300).length, 3);
+  assert.equal(aggregateCandles(bars, 600).length, 2);
+  assert.deepEqual(aggregateCandles(bars, 600)[0], {
+    time: 0, open: 100, high: 108, low: 100, close: 108, lastTime: 599,
+  });
+});
+
+test('ignores invalid rows and falls back to one-minute candles', () => {
+  const bars = [
+    { time: 60, mid: 100 },
+    { time: null, mid: 500 },
+    { time: 90, mid: Number.NaN },
+    { time: 119, mid: 101 },
+  ];
+
+  assert.deepEqual(aggregateCandles(bars, 7), [
+    { time: 60, open: 100, high: 101, low: 100, close: 101, lastTime: 119 },
+  ]);
 });

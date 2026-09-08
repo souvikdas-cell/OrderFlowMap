@@ -290,6 +290,21 @@
               <label style="color:var(--muted);font-size:10px">Simulating NIFTY · 0.10 tick · ~5pt spread</label>
             </div>
           </div>
+          <div class="row" style="margin-top:7px;border-top:1px solid var(--border);padding-top:6px">
+            <label>Chart</label>
+            <select class="btn" id="priceView" style="flex:1">
+              <option value="line" selected>Line</option>
+              <option value="candles">Candles</option>
+            </select>
+          </div>
+          <div class="row" id="candleTfRow" style="display:none">
+            <label>Timeframe</label>
+            <select class="btn" id="candleTf" style="flex:1">
+              <option value="60" selected>1 Min</option>
+              <option value="300">5 Min</option>
+              <option value="600">10 Min</option>
+            </select>
+          </div>
           <div class="row" style="margin-top:4px;border-top:1px solid var(--border);padding-top:6px">
             <label>History</label>
             <input type="number" id="histLimit" value="600" min="60" max="7200" style="width:62px;background:#0a0f17;border:1px solid #263246;color:var(--text);padding:3px 5px;border-radius:3px;font-size:11px">
@@ -479,6 +494,7 @@ const prevTick = { volume: null, ltp: null, lastSide: 'B' };
 let liveVwapNum = 0, liveVwapDen = 0;
 
 const ui = {
+  priceView:'line', candleTf:60,
   hmIntensity:1.2, hmGamma:0.65, rowH:5, showHM:true, cmap:'bookmap', hmMin:0,
   showBubbles:true, bubMin:2, bubMax:26, bubScale:'sqrt', largeQty:500,
   hollowSmall:true, minTrade:0,
@@ -494,6 +510,37 @@ const roundTick = p => Math.round(p/TICK)*TICK;
 function rng(){ return Math.random(); }
 function gauss(){ let u=0,v=0; while(u===0)u=rng(); while(v===0)v=rng();
   return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+
+/**
+ * Aggregate per-second price bars into stable OHLC candles.
+ * Invalid rows are ignored and unsupported timeframes fall back to one minute.
+ */
+function aggregateCandles(sourceBars, timeframeSec){
+  const requested = Number(timeframeSec);
+  const seconds = [60, 300, 600].includes(requested) ? requested : 60;
+  const candles = [];
+
+  for(const bar of sourceBars){
+    if(!Number.isFinite(bar?.time) || !Number.isFinite(bar?.mid)) continue;
+    const open = Number.isFinite(bar.open) ? bar.open : bar.mid;
+    const high = Number.isFinite(bar.high) ? bar.high : bar.mid;
+    const low = Number.isFinite(bar.low) ? bar.low : bar.mid;
+    const close = Number.isFinite(bar.close) ? bar.close : bar.mid;
+    const time = Math.floor(bar.time / seconds) * seconds;
+    const current = candles[candles.length - 1];
+
+    if(current?.time === time){
+      current.high = Math.max(current.high, high);
+      current.low = Math.min(current.low, low);
+      current.close = close;
+      current.lastTime = bar.time;
+    } else {
+      candles.push({time, open, high, low, close, lastTime:bar.time});
+    }
+  }
+
+  return candles;
+}
 
 /* ==================== COLOR MAPS ==================== */
 function rampStops(stops, t){
@@ -690,6 +737,68 @@ class HeatmapPrimitive{
 }
 const heatmap = new HeatmapPrimitive();
 midSeries.attachPrimitive(heatmap);
+
+/* ==================== CANDLESTICKS PRIMITIVE ==================== */
+class CandlesRenderer{
+  draw(target){
+    target.useBitmapCoordinateSpace(scope => {
+      if(ui.priceView !== 'candles' || bars.length === 0) return;
+      const {context:ctx, bitmapSize, horizontalPixelRatio:hpr, verticalPixelRatio:vpr} = scope;
+      const ts = chart.timeScale();
+      const candleData = aggregateCandles(bars, ui.candleTf);
+
+      ctx.save();
+      for(const candle of candleData){
+        const xStart = ts.timeToCoordinate(candle.time);
+        if(xStart === null) continue;
+        const xEnd = ts.timeToCoordinate(candle.lastTime);
+        const x = ((xEnd ?? xStart) + xStart) * 0.5 * hpr;
+        const intervalWidth = Math.abs((xEnd ?? xStart) - xStart) * hpr;
+        const bodyWidth = clamp(intervalWidth * 0.72, 3 * hpr, 32 * hpr);
+        const yOpen = midSeries.priceToCoordinate(candle.open);
+        const yHigh = midSeries.priceToCoordinate(candle.high);
+        const yLow = midSeries.priceToCoordinate(candle.low);
+        const yClose = midSeries.priceToCoordinate(candle.close);
+        if([yOpen,yHigh,yLow,yClose].some(y => y === null)) continue;
+
+        const rising = candle.close >= candle.open;
+        const color = rising ? '#26a69a' : '#ef5350';
+        const top = Math.min(yOpen, yClose) * vpr;
+        const bottom = Math.max(yOpen, yClose) * vpr;
+        const bodyHeight = Math.max(1.5 * vpr, bottom - top);
+
+        if(x + bodyWidth < 0 || x - bodyWidth > bitmapSize.width) continue;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = Math.max(1, hpr);
+        ctx.beginPath();
+        ctx.moveTo(x, yHigh * vpr);
+        ctx.lineTo(x, yLow * vpr);
+        ctx.stroke();
+
+        ctx.fillStyle = rising ? 'rgba(38,166,154,0.82)' : 'rgba(239,83,80,0.82)';
+        ctx.strokeStyle = rising ? '#7fdcd0' : '#ff8a87';
+        ctx.fillRect(x - bodyWidth * 0.5, top, bodyWidth, bodyHeight);
+        ctx.strokeRect(x - bodyWidth * 0.5, top, bodyWidth, bodyHeight);
+      }
+      ctx.restore();
+    });
+  }
+}
+class CandlesView{
+  constructor(){ this._renderer = new CandlesRenderer(); }
+  renderer(){ return this._renderer; }
+  zOrder(){ return 'normal'; }
+}
+class CandlesPrimitive{
+  constructor(){ this._views = [new CandlesView()]; }
+  attached(p){ this._req = p.requestUpdate; }
+  detached(){ this._req = null; }
+  updateAllViews(){}
+  paneViews(){ return this._views; }
+  requestUpdate(){ this._req?.(); }
+}
+const candleLayer = new CandlesPrimitive();
+midSeries.attachPrimitive(candleLayer);
 
 /* ==================== WALLS PRIMITIVE ==================== */
 class WallsRenderer{
@@ -987,7 +1096,8 @@ function simulateTick(now){
   const _vN = (last? last._vN:0)+secVwapNum;
   const _vD = (last? last._vD:0)+secVwapDen;
   const sessionV = _vD>0 ? _vN/_vD : MID;
-  bars.push({time:t, mid:MID, bbid, bask, vwap:roundTick(sessionV*10)/10, _vN, _vD});
+  bars.push({time:t, open:MID, high:MID, low:MID, close:MID,
+    mid:MID, bbid, bask, vwap:roundTick(sessionV*10)/10, _vN, _vD});
   depth.push({time:t, bids:bidsL, asks:asksL});
   cvdBars.push({time:t, value:cvd});
 
@@ -1269,6 +1379,11 @@ function processLiveData(data){
 
   if(lastBar && lastBar.time === exchangeTime){
     // Same second — update in place
+    const prior = lastBar.close ?? lastBar.mid;
+    lastBar.open ??= prior;
+    lastBar.high = Math.max(lastBar.high ?? prior, currentLtp);
+    lastBar.low = Math.min(lastBar.low ?? prior, currentLtp);
+    lastBar.close = currentLtp;
     lastBar.mid = currentLtp;
     lastBar.bbid = bbid;
     lastBar.bask = bask;
@@ -1288,7 +1403,8 @@ function processLiveData(data){
   } else {
     // New second — push new entries
     bars.push({
-      time: exchangeTime, mid: currentLtp, bbid, bask,
+      time: exchangeTime, open:currentLtp, high:currentLtp, low:currentLtp, close:currentLtp,
+      mid: currentLtp, bbid, bask,
       vwap: Math.round(vwap / TICK) * TICK,
       _vN: liveVwapNum, _vD: liveVwapDen
     });
@@ -1397,6 +1513,7 @@ function applySeriesData(){
   } else markers.setMarkers([]);
 
   heatmap.requestUpdate();
+  candleLayer.requestUpdate();
 }
 
 function updateUI(){
@@ -1620,6 +1737,17 @@ bindNumber('minTrade','minTrade');
 bindNumber('hmMin','hmMin');
 bindSelect('cmap','cmap');
 bindSelect('bubScale','bubScale');
+
+document.getElementById('priceView').addEventListener('change', e => {
+  ui.priceView = e.target.value === 'candles' ? 'candles' : 'line';
+  document.getElementById('candleTfRow').style.display = ui.priceView === 'candles' ? 'flex' : 'none';
+  applySeriesData();
+});
+document.getElementById('candleTf').addEventListener('change', e => {
+  const requested = Number(e.target.value);
+  ui.candleTf = [60, 300, 600].includes(requested) ? requested : 60;
+  applySeriesData();
+});
 
 // History limit
 document.getElementById('histLimit').addEventListener('change', e => {
