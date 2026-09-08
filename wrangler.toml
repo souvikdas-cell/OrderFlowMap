@@ -1,0 +1,7 @@
+name = "orderflowmap"
+compatibility_date = "2026-07-01"
+
+# Static site: no Worker code, Cloudflare serves the files in this folder.
+# index.html at the root becomes the page at /.
+[assets]
+directory = "."
