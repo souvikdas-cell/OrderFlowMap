@@ -472,6 +472,7 @@ let cvd = 0;
 const tradeVolByPrice = new Map();
 let liveWs = null;
 let liveMsgCount = 0;
+let liveMerged = {};   // latest depth + quote fields merged across the two subscriptions
 
 // Live mode: previous tick tracking for trade detection
 const prevTick = { volume: null, ltp: null, lastSide: 'B' };
@@ -1032,7 +1033,13 @@ function connectLive(){
   const url = document.getElementById('wsUrl').value.trim();
   const apiKey = document.getElementById('apiKey').value.trim();
   const symbol = document.getElementById('wsSymbol').value.trim().toUpperCase();
-  const exchange = document.getElementById('wsExchange').value;
+  const exSel = document.getElementById('wsExchange');
+  // Derivatives live on NFO/BFO. Fix the common slip of leaving the equity exchange selected.
+  if(/FUT$|\d+(CE|PE)$/.test(symbol)){
+    if(exSel.value === 'NSE') exSel.value = 'NFO';
+    else if(exSel.value === 'BSE') exSel.value = 'BFO';
+  }
+  const exchange = exSel.value;
 
   if(!url){ connLog('URL required','err'); return; }
   if(!apiKey){ connLog('API key required','err'); return; }
@@ -1087,13 +1094,22 @@ function connectLive(){
     if(msg.message === 'Authentication successful'){
       connLog('Authenticated ✓','ok');
       setConnStatus('wait','Subscribing…');
-      // Subscribe
+      // Subscribe to Depth (mode 3) for the book and Quote (mode 2) for ltp/volume.
+      // Some adapters (Fyers) omit volume from depth messages, which would
+      // starve trade detection; merging both streams keeps bubbles/CVD alive.
+      liveMerged = {};
       liveWs.send(JSON.stringify({
         action: 'subscribe',
         symbol: symbol,
         exchange: exchange,
         mode: 3,
         depth: 5
+      }));
+      liveWs.send(JSON.stringify({
+        action: 'subscribe',
+        symbol: symbol,
+        exchange: exchange,
+        mode: 2
       }));
       return;
     }
@@ -1122,7 +1138,14 @@ function connectLive(){
     // Market data
     if(msg.type === 'market_data'){
       liveMsgCount++;
-      processLiveData(msg.data);
+      const d = msg.data || {};
+      // Merge streams: depth messages own the book, quote messages own volume.
+      if(d.depth) liveMerged.depth = d.depth;
+      if(d.volume !== undefined && d.volume !== null) liveMerged.volume = d.volume;
+      if(d.ltp !== undefined) liveMerged.ltp = d.ltp;
+      if(d.ltt) liveMerged.ltt = d.ltt;
+      if(d.timestamp) liveMerged.timestamp = d.timestamp;
+      processLiveData(Object.assign({}, liveMerged));
       return;
     }
 
@@ -1158,7 +1181,8 @@ function processLiveData(data){
   if(!data || data.ltp === undefined) return;
 
   const currentLtp = data.ltp;
-  const currentVolume = data.volume || 0;
+  const haveVolume = typeof data.volume === 'number' && data.volume > 0;
+  const currentVolume = haveVolume ? data.volume : 0;
 
   // Timestamp: use ltt (last traded time) as exchange timestamp, fallback to timestamp
   // OpenAlgo adapters differ: some send ms, some (e.g. Fyers) send seconds. Normalise.
@@ -1183,10 +1207,14 @@ function processLiveData(data){
   let tradeSide = prevTick.lastSide || 'B';
 
   if(prevTick.volume === null){
-    // First tick — initialize, no trade
-    prevTick.volume = currentVolume;
-    prevTick.ltp = currentLtp;
-  } else {
+    // First tick with a real volume — initialize, no trade.
+    // Depth-only ticks (no volume yet) still build the book but never seed the baseline,
+    // otherwise the first quote would register the whole day's volume as one trade.
+    if(haveVolume){
+      prevTick.volume = currentVolume;
+      prevTick.ltp = currentLtp;
+    }
+  } else if(haveVolume){
     const volumeDelta = currentVolume - prevTick.volume;
     if(volumeDelta > 0){
       tradeDetected = true;
