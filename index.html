@@ -395,7 +395,7 @@
                <span class="dot" style="background:#f5c542"></span>VWAP</div>
           <div><span class="sq" style="background:linear-gradient(90deg,#0a0f17,#7fdcd0)"></span>Bid liquidity &nbsp;
                <span class="sq" style="background:linear-gradient(90deg,#0a0f17,#ffb4b1)"></span>Ask liquidity</div>
-          <div style="color:var(--muted);font-size:10px;margin-top:2px">
+          <div id="bubbleLegend" style="color:var(--muted);font-size:10px;margin-top:2px">
             Trades: ◯ buy · ● sell · size ∝ qty
           </div>
         </div>
@@ -511,13 +511,18 @@ function rng(){ return Math.random(); }
 function gauss(){ let u=0,v=0; while(u===0)u=rng(); while(v===0)v=rng();
   return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
 
+/** Return a supported clock interval in seconds. */
+function normaliseCandleTimeframe(timeframeSec){
+  const requested = Number(timeframeSec);
+  return [60, 300, 600].includes(requested) ? requested : 60;
+}
+
 /**
- * Aggregate per-second price bars into stable OHLC candles.
+ * Aggregate per-second price bars into clock-aligned OHLC candles.
  * Invalid rows are ignored and unsupported timeframes fall back to one minute.
  */
 function aggregateCandles(sourceBars, timeframeSec){
-  const requested = Number(timeframeSec);
-  const seconds = [60, 300, 600].includes(requested) ? requested : 60;
+  const seconds = normaliseCandleTimeframe(timeframeSec);
   const candles = [];
 
   for(const bar of sourceBars){
@@ -535,11 +540,48 @@ function aggregateCandles(sourceBars, timeframeSec){
       current.close = close;
       current.lastTime = bar.time;
     } else {
-      candles.push({time, open, high, low, close, lastTime:bar.time});
+      candles.push({time, firstTime:bar.time, open, high, low, close, lastTime:bar.time});
     }
   }
 
   return candles;
+}
+
+/**
+ * Combine executed volume by fixed candle interval and aggressor side.
+ * The resulting price is the volume-weighted execution price for that side.
+ */
+function aggregateTrades(sourceTrades, timeframeSec){
+  const seconds = normaliseCandleTimeframe(timeframeSec);
+  const buckets = new Map();
+
+  for(const trade of sourceTrades){
+    if(trade?.time == null) continue;
+    const timeValue = Number(trade?.time);
+    const price = Number(trade?.price);
+    const qty = Number(trade?.qty);
+    const side = trade?.side === 'B' ? 'B' : trade?.side === 'S' ? 'S' : null;
+    if(!Number.isFinite(timeValue) || !Number.isFinite(price) || !Number.isFinite(qty) || qty <= 0 || !side) continue;
+
+    const time = Math.floor(timeValue / seconds) * seconds;
+    const key = `${time}:${side}`;
+    const current = buckets.get(key);
+    if(current){
+      current.qty += qty;
+      current.notional += price * qty;
+      current.price = current.notional / current.qty;
+      current.lastTime = Math.max(current.lastTime, timeValue);
+    } else {
+      buckets.set(key, {
+        time, firstTime:timeValue, lastTime:timeValue, side,
+        qty, notional:price * qty, price,
+      });
+    }
+  }
+
+  return [...buckets.values()]
+    .sort((a,b) => a.time - b.time || a.side.localeCompare(b.side))
+    .map(({notional, ...trade}) => trade);
 }
 
 /* ==================== COLOR MAPS ==================== */
@@ -749,7 +791,7 @@ class CandlesRenderer{
 
       ctx.save();
       for(const candle of candleData){
-        const xStart = ts.timeToCoordinate(candle.time);
+        const xStart = ts.timeToCoordinate(candle.firstTime);
         if(xStart === null) continue;
         const xEnd = ts.timeToCoordinate(candle.lastTime);
         const x = ((xEnd ?? xStart) + xStart) * 0.5 * hpr;
@@ -923,10 +965,24 @@ class BubblesRenderer{
       if(!ui.showBubbles || trades.length===0) return;
       const { context:ctx, bitmapSize, horizontalPixelRatio:hpr, verticalPixelRatio:vpr } = scope;
       const ts = chart.timeScale();
+      const displayTrades = ui.priceView === 'candles'
+        ? aggregateTrades(trades, ui.candleTf)
+        : trades;
+      const candleIntervals = ui.priceView === 'candles'
+        ? new Map(aggregateCandles(bars, ui.candleTf).map(candle => [candle.time, candle]))
+        : null;
+      const tradeX = trade => {
+        if(!candleIntervals) return ts.timeToCoordinate(trade.time);
+        const interval = candleIntervals.get(trade.time);
+        const xStart = ts.timeToCoordinate(interval?.firstTime ?? trade.firstTime);
+        const xEnd = ts.timeToCoordinate(interval?.lastTime ?? trade.lastTime);
+        if(xStart === null) return null;
+        return ((xEnd ?? xStart) + xStart) * 0.5;
+      };
 
       let gMax=1;
-      const start = Math.max(0, trades.length-3000);
-      for(let i=start;i<trades.length;i++) if(trades[i].qty>gMax) gMax=trades[i].qty;
+      const start = Math.max(0, displayTrades.length-3000);
+      for(let i=start;i<displayTrades.length;i++) if(displayTrades[i].qty>gMax) gMax=displayTrades[i].qty;
 
       const minR = ui.bubMin*hpr, maxR = ui.bubMax*hpr;
       const sizeFn = (q) => {
@@ -939,11 +995,11 @@ class BubblesRenderer{
 
       ctx.save();
       // Pass 1: small/hollow
-      for(let i=0;i<trades.length;i++){
-        const tr = trades[i];
+      for(let i=0;i<displayTrades.length;i++){
+        const tr = displayTrades[i];
         if(tr.qty < ui.minTrade) continue;
         if(tr.qty >= ui.largeQty) continue;
-        const x = ts.timeToCoordinate(tr.time);
+        const x = tradeX(tr);
         if(x===null) continue;
         const y = midSeries.priceToCoordinate(tr.price);
         if(y===null) continue;
@@ -965,10 +1021,10 @@ class BubblesRenderer{
         }
       }
       // Pass 2: large with halo
-      for(let i=0;i<trades.length;i++){
-        const tr = trades[i];
+      for(let i=0;i<displayTrades.length;i++){
+        const tr = displayTrades[i];
         if(tr.qty < ui.largeQty) continue;
-        const x = ts.timeToCoordinate(tr.time);
+        const x = tradeX(tr);
         if(x===null) continue;
         const y = midSeries.priceToCoordinate(tr.price);
         if(y===null) continue;
@@ -1499,11 +1555,22 @@ function applySeriesData(){
   cvdSeries.setData(ui.showCVD? cvdBars : []);
 
   if(ui.showLargeMarkers){
-    const recent = trades.filter(t=>t.qty>=ui.largeQty).slice(-80);
+    let recent;
+    if(ui.priceView === 'candles'){
+      const strongestByCandle = new Map();
+      for(const trade of aggregateTrades(trades, ui.candleTf)){
+        if(trade.qty < ui.largeQty) continue;
+        const existing = strongestByCandle.get(trade.time);
+        if(!existing || trade.qty > existing.qty) strongestByCandle.set(trade.time, trade);
+      }
+      recent = [...strongestByCandle.values()].slice(-80);
+    } else {
+      recent = trades.filter(t=>t.qty>=ui.largeQty).slice(-80);
+    }
     const seen = new Set(); const mks=[];
     for(const t of recent){
       if(seen.has(t.time)) continue; seen.add(t.time);
-      mks.push({ time:t.time,
+      mks.push({ time:ui.priceView === 'candles' ? t.lastTime : t.time,
         position: t.side==='B'?'belowBar':'aboveBar',
         color: t.side==='B'?'#9ff7e9':'#ffb4b1',
         shape: t.side==='B'?'arrowUp':'arrowDown',
@@ -1738,15 +1805,28 @@ bindNumber('hmMin','hmMin');
 bindSelect('cmap','cmap');
 bindSelect('bubScale','bubScale');
 
+function updateBubbleLegend(){
+  const label = document.getElementById('bubbleLegend');
+  if(ui.priceView === 'candles'){
+    label.textContent = `Candles: one buy + one sell bubble · qty = ${ui.candleTf / 60} Min sum`;
+  } else {
+    label.textContent = 'Trades: ◯ buy · ● sell · size ∝ qty';
+  }
+}
+
 document.getElementById('priceView').addEventListener('change', e => {
   ui.priceView = e.target.value === 'candles' ? 'candles' : 'line';
   document.getElementById('candleTfRow').style.display = ui.priceView === 'candles' ? 'flex' : 'none';
+  updateBubbleLegend();
   applySeriesData();
+  requestAnimationFrame(() => chart.timeScale().fitContent());
 });
 document.getElementById('candleTf').addEventListener('change', e => {
   const requested = Number(e.target.value);
   ui.candleTf = [60, 300, 600].includes(requested) ? requested : 60;
+  updateBubbleLegend();
   applySeriesData();
+  requestAnimationFrame(() => chart.timeScale().fitContent());
 });
 
 // History limit

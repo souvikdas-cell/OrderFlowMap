@@ -12,17 +12,22 @@ assert.notEqual(connectStart, -1, 'connectLive must exist');
 assert.notEqual(connectEnd, -1, 'disconnectLive must follow connectLive');
 
 const connectSource = html.slice(connectStart, connectEnd);
-const aggregateStart = html.indexOf('function aggregateCandles(');
+const aggregateStart = html.indexOf('function normaliseCandleTimeframe(');
 const aggregateEnd = html.indexOf('\n/* ==================== COLOR MAPS', aggregateStart);
 
-assert.notEqual(aggregateStart, -1, 'aggregateCandles must exist');
+assert.notEqual(aggregateStart, -1, 'candle aggregation helpers must exist');
 assert.notEqual(aggregateEnd, -1, 'color maps must follow aggregateCandles');
 
 const aggregateSource = html.slice(aggregateStart, aggregateEnd);
 const aggregateContext = {};
-vm.runInNewContext(`${aggregateSource}\nglobalThis.aggregateCandles = aggregateCandles;`, aggregateContext);
+vm.runInNewContext(
+  `${aggregateSource}\nglobalThis.aggregateCandles = aggregateCandles; globalThis.aggregateTrades = aggregateTrades;`,
+  aggregateContext,
+);
 const aggregateCandles = (bars, seconds) =>
   JSON.parse(JSON.stringify(aggregateContext.aggregateCandles(bars, seconds)));
+const aggregateTrades = (trades, seconds) =>
+  JSON.parse(JSON.stringify(aggregateContext.aggregateTrades(trades, seconds)));
 
 function makeHarness({ symbol = 'RELIANCE', exchange = 'NSE', apiKey = 'test-key' } = {}) {
   const elements = {
@@ -116,9 +121,29 @@ test('aggregates per-second OHLC data into one-minute candles', () => {
   ];
 
   assert.deepEqual(aggregateCandles(bars, 60), [
-    { time: 120, open: 100, high: 104, low: 99, close: 103, lastTime: 150 },
-    { time: 180, open: 103, high: 103, low: 97, close: 98, lastTime: 180 },
+    { time: 120, firstTime: 120, open: 100, high: 104, low: 99, close: 103, lastTime: 150 },
+    { time: 180, firstTime: 180, open: 103, high: 103, low: 97, close: 98, lastTime: 180 },
   ]);
+});
+
+test('keeps a late connection as a partial clock-aligned candle', () => {
+  const startOfMinute = 9 * 3600 + 15 * 60;
+  const candles = aggregateCandles([
+    { time: startOfMinute + 35, mid: 100 },
+    { time: startOfMinute + 59, mid: 102 },
+    { time: startOfMinute + 60, mid: 101 },
+  ], 60);
+
+  assert.deepEqual(candles[0], {
+    time: startOfMinute,
+    firstTime: startOfMinute + 35,
+    open: 100,
+    high: 102,
+    low: 100,
+    close: 102,
+    lastTime: startOfMinute + 59,
+  });
+  assert.equal(candles[1].time, startOfMinute + 60);
 });
 
 test('supports five-minute and ten-minute candle boundaries', () => {
@@ -133,7 +158,7 @@ test('supports five-minute and ten-minute candle boundaries', () => {
   assert.equal(aggregateCandles(bars, 300).length, 3);
   assert.equal(aggregateCandles(bars, 600).length, 2);
   assert.deepEqual(aggregateCandles(bars, 600)[0], {
-    time: 0, open: 100, high: 108, low: 100, close: 108, lastTime: 599,
+    time: 0, firstTime: 0, open: 100, high: 108, low: 100, close: 108, lastTime: 599,
   });
 });
 
@@ -146,6 +171,45 @@ test('ignores invalid rows and falls back to one-minute candles', () => {
   ];
 
   assert.deepEqual(aggregateCandles(bars, 7), [
-    { time: 60, open: 100, high: 101, low: 100, close: 101, lastTime: 119 },
+    { time: 60, firstTime: 60, open: 100, high: 101, low: 100, close: 101, lastTime: 119 },
+  ]);
+});
+
+test('combines buy and sell bubbles separately inside each candle', () => {
+  const aggregated = aggregateTrades([
+    { time: 35, price: 100, qty: 100, side: 'B' },
+    { time: 50, price: 102, qty: 200, side: 'B' },
+    { time: 55, price: 99, qty: 80, side: 'S' },
+    { time: 60, price: 103, qty: 40, side: 'B' },
+  ], 60);
+
+  assert.deepEqual(aggregated, [
+    { time: 0, firstTime: 35, lastTime: 50, side: 'B', qty: 300, price: 30400 / 300 },
+    { time: 0, firstTime: 55, lastTime: 55, side: 'S', qty: 80, price: 99 },
+    { time: 60, firstTime: 60, lastTime: 60, side: 'B', qty: 40, price: 103 },
+  ]);
+});
+
+test('rescales combined bubbles when changing to five and ten minutes', () => {
+  const trades = [
+    { time: 0, price: 100, qty: 100, side: 'B' },
+    { time: 299, price: 102, qty: 200, side: 'B' },
+    { time: 300, price: 104, qty: 400, side: 'B' },
+    { time: 599, price: 106, qty: 800, side: 'B' },
+  ];
+
+  assert.deepEqual(aggregateTrades(trades, 300).map(t => t.qty), [300, 1200]);
+  assert.deepEqual(aggregateTrades(trades, 600).map(t => t.qty), [1500]);
+});
+
+test('ignores invalid trades during candle aggregation', () => {
+  assert.deepEqual(aggregateTrades([
+    { time: 0, price: 100, qty: 20, side: 'B' },
+    { time: null, price: 100, qty: 20, side: 'B' },
+    { time: 10, price: Number.NaN, qty: 20, side: 'B' },
+    { time: 20, price: 100, qty: 0, side: 'B' },
+    { time: 30, price: 100, qty: 20, side: 'X' },
+  ], 60), [
+    { time: 0, firstTime: 0, lastTime: 0, side: 'B', qty: 20, price: 100 },
   ]);
 });
